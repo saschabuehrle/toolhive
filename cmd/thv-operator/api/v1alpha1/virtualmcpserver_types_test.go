@@ -479,3 +479,63 @@ func TestValidateEmbeddingServer(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAuthServerConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		server      *VirtualMCPServer
+		expectError bool
+		errContains string
+	}{
+		{
+			name: "nil_ref_passes",
+			server: &VirtualMCPServer{
+				Spec: VirtualMCPServerSpec{
+					Config: config.Config{Group: "test-group"},
+				},
+			},
+		},
+		{
+			name: "valid_name_passes",
+			server: &VirtualMCPServer{
+				Spec: VirtualMCPServerSpec{
+					Config: config.Config{Group: "test-group"},
+					AuthServerConfigRef: &ExternalAuthConfigRef{
+						Name: "my-auth-server",
+					},
+				},
+			},
+		},
+		{
+			name: "empty_name_errors",
+			server: &VirtualMCPServer{
+				Spec: VirtualMCPServerSpec{
+					Config: config.Config{Group: "test-group"},
+					AuthServerConfigRef: &ExternalAuthConfigRef{
+						Name: "",
+					},
+				},
+			},
+			expectError: true,
+			errContains: "spec.authServerConfigRef.name is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.server.Validate()
+			if tt.expectError {
+				require.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}

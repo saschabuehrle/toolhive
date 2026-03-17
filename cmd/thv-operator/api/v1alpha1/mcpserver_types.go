@@ -629,14 +629,6 @@ type ToolConfigRef struct {
 	Name string `json:"name"`
 }
 
-// ExternalAuthConfigRef defines a reference to a MCPExternalAuthConfig resource.
-// The referenced MCPExternalAuthConfig must be in the same namespace as the MCPServer.
-type ExternalAuthConfigRef struct {
-	// Name is the name of the MCPExternalAuthConfig resource
-	// +kubebuilder:validation:Required
-	Name string `json:"name"`
-}
-
 // InlineAuthzConfig contains direct authorization configuration
 type InlineAuthzConfig struct {
 	// Policies is a list of Cedar policy strings

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/stacklok/toolhive/pkg/audit"
+	"github.com/stacklok/toolhive/pkg/authserver"
 	thvjson "github.com/stacklok/toolhive/pkg/json"
 	"github.com/stacklok/toolhive/pkg/telemetry"
 	"github.com/stacklok/toolhive/pkg/vmcp"
@@ -158,6 +159,19 @@ type Config struct {
 	Optimizer *OptimizerConfig `json:"optimizer,omitempty" yaml:"optimizer,omitempty"`
 }
 
+// RuntimeConfig extends Config with runtime-only fields that are populated
+// post-deserialization by the converter (Kubernetes) or CLI loader.
+// These fields are never part of the CRD schema.
+type RuntimeConfig struct {
+	Config
+
+	// AuthServer configures an embedded OAuth authorization server.
+	// When set, the vMCP server acts as an OIDC issuer, drives users through upstream IDPs,
+	// accumulates tokens, and issues ToolHive JWTs. When nil, behavior is unchanged.
+	// Populated by the converter from AuthServerConfigRef or by the CLI loader.
+	AuthServer *AuthServerConfig
+}
+
 // IncomingAuthConfig configures client authentication to the virtual MCP server.
 //
 // Note: When using the Kubernetes operator (VirtualMCPServer CRD), the
@@ -211,6 +225,12 @@ type OIDCConfig struct {
 	// ProtectedResourceAllowPrivateIP allows protected resource endpoint on private IP addresses
 	// Use with caution - only enable for trusted internal IDPs or testing
 	ProtectedResourceAllowPrivateIP bool `json:"protectedResourceAllowPrivateIp,omitempty" yaml:"protectedResourceAllowPrivateIp,omitempty"` //nolint:lll
+
+	// JwksAllowPrivateIP allows OIDC discovery and JWKS fetches to private IP addresses.
+	// Enable when the embedded auth server runs on a loopback address and
+	// the OIDC middleware needs to fetch its JWKS from that address.
+	// Use with caution - only enable for trusted internal IDPs or testing.
+	JwksAllowPrivateIP bool `json:"jwksAllowPrivateIp,omitempty" yaml:"jwksAllowPrivateIp,omitempty"`
 
 	// InsecureAllowHTTP allows HTTP (non-HTTPS) OIDC issuers for development/testing
 	// WARNING: This is insecure and should NEVER be used in production
@@ -788,6 +808,50 @@ type OptimizerConfig struct {
 	// +kubebuilder:validation:Pattern=`^([0-9]*[.])?[0-9]+$`
 	// +optional
 	SemanticDistanceThreshold string `json:"semanticDistanceThreshold,omitempty" yaml:"semanticDistanceThreshold,omitempty"`
+}
+
+// AuthServerConfig wraps the authserver.RunConfig for the vMCP config model.
+// This is a runtime-only config populated by the converter or CLI loader.
+// It is never round-tripped through the Kubernetes API server, so deepcopy
+// performs a shallow copy (pointer sharing is safe for read-only runtime config).
+//
+// The RunConfig is stored as an unexported field to prevent reflection-based
+// validation (checkStructTags, collectStructTypes) from traversing into it.
+// The authserver.RunConfig intentionally uses snake_case JSON/YAML tags (it is
+// a standalone serializable config, not a CRD field), which would conflict
+// with the camelCase convention enforced on vMCP config types.
+type AuthServerConfig struct {
+	runConfig *authserver.RunConfig
+}
+
+// NewAuthServerConfig creates an AuthServerConfig wrapping the given RunConfig.
+func NewAuthServerConfig(rc *authserver.RunConfig) *AuthServerConfig {
+	return &AuthServerConfig{runConfig: rc}
+}
+
+// RunConfig returns the underlying authserver.RunConfig.
+func (c *AuthServerConfig) RunConfig() *authserver.RunConfig {
+	if c == nil {
+		return nil
+	}
+	return c.runConfig
+}
+
+// DeepCopyInto copies the receiver into out. Since AuthServerConfig wraps a
+// runtime-only RunConfig that is never mutated after construction, a shallow
+// copy (sharing the underlying RunConfig pointer) is safe.
+func (in *AuthServerConfig) DeepCopyInto(out *AuthServerConfig) {
+	*out = *in
+}
+
+// DeepCopy returns a shallow copy of the AuthServerConfig.
+func (in *AuthServerConfig) DeepCopy() *AuthServerConfig {
+	if in == nil {
+		return nil
+	}
+	out := new(AuthServerConfig)
+	in.DeepCopyInto(out)
+	return out
 }
 
 // Validator validates configuration.

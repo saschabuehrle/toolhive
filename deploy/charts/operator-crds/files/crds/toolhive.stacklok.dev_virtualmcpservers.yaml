@@ -64,6 +64,20 @@ spec:
           spec:
             description: VirtualMCPServerSpec defines the desired state of VirtualMCPServer
             properties:
+              authServerConfigRef:
+                description: |-
+                  AuthServerConfigRef references an MCPExternalAuthConfig resource that configures
+                  an embedded OAuth authorization server. When set, the vMCP server acts as
+                  an OIDC issuer, drives users through upstream IDPs, and issues ToolHive JWTs.
+                  The referenced MCPExternalAuthConfig must have type "embeddedAuthServer" and exist
+                  in the same namespace.
+                properties:
+                  name:
+                    description: Name is the name of the MCPExternalAuthConfig resource
+                    type: string
+                required:
+                - name
+                type: object
               config:
                 description: |-
                   Config is the Virtual MCP server configuration
@@ -578,6 +592,13 @@ spec:
                             description: Issuer is the OIDC issuer URL.
                             pattern: ^https?://
                             type: string
+                          jwksAllowPrivateIp:
+                            description: |-
+                              JwksAllowPrivateIP allows OIDC discovery and JWKS fetches to private IP addresses.
+                              Enable when the embedded auth server runs on a loopback address and
+                              the OIDC middleware needs to fetch its JWKS from that address.
+                              Use with caution - only enable for trusted internal IDPs or testing.
+                            type: boolean
                           protectedResourceAllowPrivateIp:
                             description: |-
                               ProtectedResourceAllowPrivateIP allows protected resource endpoint on private IP addresses
