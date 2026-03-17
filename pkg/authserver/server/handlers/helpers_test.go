@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"errors"
 	"testing"
 	"time"
 
@@ -93,8 +94,9 @@ type testStorageState struct {
 	idpTokenCount      int
 }
 
-// handlerTestSetup creates a test setup with all dependencies including an upstream provider.
-func handlerTestSetup(t *testing.T) (*Handler, *testStorageState, *mockIDPProvider) {
+// baseTestSetup creates the shared test infrastructure (RSA keys, fosite provider, mock storage
+// with all non-upstream-token expectations wired). Callers add upstream token mocks and create the Handler.
+func baseTestSetup(t *testing.T) (fosite.OAuth2Provider, *server.AuthorizationServerConfig, *mocks.MockStorage, *testStorageState) {
 	t.Helper()
 
 	ctrl := gomock.NewController(t)
@@ -187,30 +189,6 @@ func handlerTestSetup(t *testing.T) (*Handler, *testStorageState, *mockIDPProvid
 			}
 			delete(storState.pendingAuths, state)
 			return nil
-		}).AnyTimes()
-
-	// Setup mock expectations for upstream tokens storage
-	// Assert the providerName matches the handler's upstreamName ("test-upstream")
-	stor.EXPECT().StoreUpstreamTokens(gomock.Any(), gomock.Any(), gomock.Eq("test-upstream"), gomock.Any()).DoAndReturn(
-		func(_ context.Context, sessionID, _ string, tokens *storage.UpstreamTokens) error {
-			storState.upstreamTokens[sessionID] = tokens
-			storState.idpTokenCount++
-			return nil
-		}).AnyTimes()
-
-	stor.EXPECT().DeleteUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, sessionID string) error {
-			delete(storState.upstreamTokens, sessionID)
-			return nil
-		}).AnyTimes()
-
-	stor.EXPECT().GetAllUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_ context.Context, _ string) (map[string]*storage.UpstreamTokens, error) {
-			result := make(map[string]*storage.UpstreamTokens)
-			for _, tokens := range storState.upstreamTokens {
-				result[tokens.ProviderID] = tokens
-			}
-			return result, nil
 		}).AnyTimes()
 
 	// Setup mock expectations for authorization code storage (needed by fosite)
@@ -331,6 +309,48 @@ func handlerTestSetup(t *testing.T) (*Handler, *testStorageState, *mockIDPProvid
 		compose.OAuth2PKCEFactory,
 	)
 
+	return provider, oauth2Config, stor, storState
+}
+
+// handlerTestSetup creates a test setup with all dependencies including an upstream provider.
+func handlerTestSetup(t *testing.T) (*Handler, *testStorageState, *mockIDPProvider) {
+	t.Helper()
+
+	provider, oauth2Config, stor, storState := baseTestSetup(t)
+
+	// Setup mock expectations for upstream tokens storage.
+	// Assert the providerName matches the handler's upstreamName ("test-upstream").
+	// Keyed by "sessionID:providerName" to correctly scope by session.
+	stor.EXPECT().StoreUpstreamTokens(gomock.Any(), gomock.Any(), gomock.Eq("test-upstream"), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID, providerName string, tokens *storage.UpstreamTokens) error {
+			key := sessionID + ":" + providerName
+			storState.upstreamTokens[key] = tokens
+			storState.idpTokenCount++
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().DeleteUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID string) error {
+			for key := range storState.upstreamTokens {
+				if len(key) > len(sessionID) && key[:len(sessionID)+1] == sessionID+":" {
+					delete(storState.upstreamTokens, key)
+				}
+			}
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().GetAllUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID string) (map[string]*storage.UpstreamTokens, error) {
+			result := make(map[string]*storage.UpstreamTokens)
+			prefix := sessionID + ":"
+			for key, tokens := range storState.upstreamTokens {
+				if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+					result[tokens.ProviderID] = tokens
+				}
+			}
+			return result, nil
+		}).AnyTimes()
+
 	mockUpstream := &mockIDPProvider{
 		providerType:     upstream.ProviderTypeOAuth2,
 		authorizationURL: "https://idp.example.com/authorize",
@@ -349,4 +369,327 @@ func handlerTestSetup(t *testing.T) (*Handler, *testStorageState, *mockIDPProvid
 	handler := NewHandler(provider, oauth2Config, stor, upstreams, []string{"test-upstream"})
 
 	return handler, storState, mockUpstream
+}
+
+// multiUpstreamTestSetup creates a test setup with two upstream providers ("provider-1" and "provider-2")
+// for testing multi-upstream authorization chain logic. Includes full storage mocks for the callback flow.
+// The upstreamTokens map uses composite keys ("sessionID:providerName") so that GetAllUpstreamTokens
+// returns tokens scoped to the requested session.
+func multiUpstreamTestSetup(t *testing.T) (*Handler, *testStorageState, *mockIDPProvider, *mockIDPProvider) {
+	t.Helper()
+
+	provider, oauth2Config, stor, storState := baseTestSetup(t)
+
+	// Setup mock expectations for upstream tokens storage.
+	// Keyed by "sessionID:providerName" to support multiple providers per session.
+	stor.EXPECT().StoreUpstreamTokens(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID, providerName string, tokens *storage.UpstreamTokens) error {
+			key := sessionID + ":" + providerName
+			storState.upstreamTokens[key] = tokens
+			storState.idpTokenCount++
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().DeleteUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID string) error {
+			// Delete all tokens for the session
+			for key := range storState.upstreamTokens {
+				if len(key) > len(sessionID) && key[:len(sessionID)+1] == sessionID+":" {
+					delete(storState.upstreamTokens, key)
+				}
+			}
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().GetAllUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID string) (map[string]*storage.UpstreamTokens, error) {
+			result := make(map[string]*storage.UpstreamTokens)
+			prefix := sessionID + ":"
+			for key, tokens := range storState.upstreamTokens {
+				if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+					result[tokens.ProviderID] = tokens
+				}
+			}
+			return result, nil
+		}).AnyTimes()
+
+	mockProvider1 := &mockIDPProvider{
+		providerType:     upstream.ProviderTypeOAuth2,
+		authorizationURL: "https://idp1.example.com/authorize",
+		exchangeResult: &upstream.Identity{
+			Tokens: &upstream.Tokens{
+				AccessToken:  "provider1-access-token",
+				RefreshToken: "provider1-refresh-token",
+				IDToken:      "provider1-id-token",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+			Subject: "user-from-provider1",
+			Name:    "First Leg User",
+			Email:   "firstleg@example.com",
+		},
+	}
+
+	mockProvider2 := &mockIDPProvider{
+		providerType:     upstream.ProviderTypeOAuth2,
+		authorizationURL: "https://idp2.example.com/authorize",
+		exchangeResult: &upstream.Identity{
+			Tokens: &upstream.Tokens{
+				AccessToken:  "provider2-access-token",
+				RefreshToken: "provider2-refresh-token",
+				IDToken:      "provider2-id-token",
+				ExpiresAt:    time.Now().Add(time.Hour),
+			},
+			Subject: "user-from-provider2",
+			Name:    "Second Leg User",
+			Email:   "secondleg@example.com",
+		},
+	}
+
+	upstreams := map[string]upstream.OAuth2Provider{
+		"provider-1": mockProvider1,
+		"provider-2": mockProvider2,
+	}
+	handler := NewHandler(provider, oauth2Config, stor, upstreams, []string{"provider-1", "provider-2"})
+
+	return handler, storState, mockProvider1, mockProvider2
+}
+
+// storePendingFailTestSetup creates a test setup where StorePendingAuthorization always
+// fails. This cannot be achieved with baseTestSetup because gomock does not support
+// overriding AnyTimes() expectations after registration.
+//
+// Load and Delete still operate on storState.pendingAuths so tests can pre-populate
+// pending authorizations directly. Upstream token mocks use composite keys like
+// multiUpstreamTestSetup. All other expectations (fosite sessions, users, etc.) are
+// identical to baseTestSetup.
+func storePendingFailTestSetup(t *testing.T) (fosite.OAuth2Provider, *server.AuthorizationServerConfig, *mocks.MockStorage, *testStorageState) {
+	t.Helper()
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(func() {
+		ctrl.Finish()
+	})
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	secret := make([]byte, 32)
+	_, err = rand.Read(secret)
+	require.NoError(t, err)
+
+	cfg := &server.AuthorizationServerParams{
+		Issuer:               testAuthIssuer,
+		AccessTokenLifespan:  time.Hour,
+		RefreshTokenLifespan: time.Hour * 24,
+		AuthCodeLifespan:     time.Minute * 10,
+		HMACSecrets:          servercrypto.NewHMACSecrets(secret),
+		SigningKeyID:         "test-key-1",
+		SigningKeyAlgorithm:  "RS256",
+		SigningKey:           rsaKey,
+		AllowedAudiences:     []string{"https://api.example.com"},
+	}
+
+	oauth2Config, err := server.NewAuthorizationServerConfig(cfg)
+	require.NoError(t, err)
+
+	storState := &testStorageState{
+		pendingAuths:       make(map[string]*storage.PendingAuthorization),
+		upstreamTokens:     make(map[string]*storage.UpstreamTokens),
+		clients:            make(map[string]fosite.Client),
+		users:              make(map[string]*storage.User),
+		providerIdentities: make(map[string]*storage.ProviderIdentity),
+		authCodeSessions:   make(map[string]fosite.Requester),
+		pkceSessions:       make(map[string]fosite.Requester),
+	}
+
+	stor := mocks.NewMockStorage(ctrl)
+
+	// Register a test client (public client for PKCE)
+	testClient := &fosite.DefaultClient{
+		ID:            testAuthClientID,
+		Secret:        nil,
+		RedirectURIs:  []string{testAuthRedirectURI},
+		ResponseTypes: []string{"code"},
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
+		Scopes:        []string{"openid", "profile", "email"},
+		Public:        true,
+	}
+	storState.clients[testAuthClientID] = testClient
+
+	stor.EXPECT().GetClient(gomock.Any(), testAuthClientID).DoAndReturn(func(_ context.Context, id string) (fosite.Client, error) {
+		if c, ok := storState.clients[id]; ok {
+			return c, nil
+		}
+		return nil, fosite.ErrNotFound
+	}).AnyTimes()
+	stor.EXPECT().GetClient(gomock.Any(), gomock.Not(testAuthClientID)).Return(nil, fosite.ErrNotFound).AnyTimes()
+
+	// StorePendingAuthorization always fails — this is the key difference from baseTestSetup
+	stor.EXPECT().StorePendingAuthorization(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(errors.New("storage unavailable")).AnyTimes()
+
+	// Load and Delete read from pre-populated state
+	stor.EXPECT().LoadPendingAuthorization(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, state string) (*storage.PendingAuthorization, error) {
+			if p, ok := storState.pendingAuths[state]; ok {
+				return p, nil
+			}
+			return nil, storage.ErrNotFound
+		}).AnyTimes()
+
+	stor.EXPECT().DeletePendingAuthorization(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, state string) error {
+			if _, ok := storState.pendingAuths[state]; !ok {
+				return storage.ErrNotFound
+			}
+			delete(storState.pendingAuths, state)
+			return nil
+		}).AnyTimes()
+
+	// Upstream token mocks (composite keys like multiUpstreamTestSetup)
+	stor.EXPECT().StoreUpstreamTokens(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID, providerName string, tokens *storage.UpstreamTokens) error {
+			key := sessionID + ":" + providerName
+			storState.upstreamTokens[key] = tokens
+			storState.idpTokenCount++
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().DeleteUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID string) error {
+			for key := range storState.upstreamTokens {
+				if len(key) > len(sessionID) && key[:len(sessionID)+1] == sessionID+":" {
+					delete(storState.upstreamTokens, key)
+				}
+			}
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().GetAllUpstreamTokens(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, sessionID string) (map[string]*storage.UpstreamTokens, error) {
+			result := make(map[string]*storage.UpstreamTokens)
+			prefix := sessionID + ":"
+			for key, tokens := range storState.upstreamTokens {
+				if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+					result[tokens.ProviderID] = tokens
+				}
+			}
+			return result, nil
+		}).AnyTimes()
+
+	// Authorization code, PKCE, access token, refresh token sessions (needed by fosite)
+	stor.EXPECT().CreateAuthorizeCodeSession(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, code string, req fosite.Requester) error {
+			storState.authCodeSessions[code] = req
+			return nil
+		}).AnyTimes()
+	stor.EXPECT().GetAuthorizeCodeSession(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, code string, _ fosite.Session) (fosite.Requester, error) {
+			if req, ok := storState.authCodeSessions[code]; ok {
+				return req, nil
+			}
+			return nil, fosite.ErrNotFound
+		}).AnyTimes()
+	stor.EXPECT().InvalidateAuthorizeCodeSession(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, code string) error {
+			delete(storState.authCodeSessions, code)
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().CreatePKCERequestSession(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, code string, req fosite.Requester) error {
+			storState.pkceSessions[code] = req
+			return nil
+		}).AnyTimes()
+	stor.EXPECT().GetPKCERequestSession(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, code string, _ fosite.Session) (fosite.Requester, error) {
+			if req, ok := storState.pkceSessions[code]; ok {
+				return req, nil
+			}
+			return nil, fosite.ErrNotFound
+		}).AnyTimes()
+	stor.EXPECT().DeletePKCERequestSession(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, code string) error {
+			delete(storState.pkceSessions, code)
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().CreateAccessTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	stor.EXPECT().GetAccessTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fosite.ErrNotFound).AnyTimes()
+	stor.EXPECT().DeleteAccessTokenSession(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	stor.EXPECT().RevokeAccessToken(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	stor.EXPECT().CreateRefreshTokenSession(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	stor.EXPECT().GetRefreshTokenSession(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, fosite.ErrNotFound).AnyTimes()
+	stor.EXPECT().DeleteRefreshTokenSession(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	stor.EXPECT().RevokeRefreshToken(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	// User storage (needed by UserResolver)
+	stor.EXPECT().CreateUser(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, user *storage.User) error {
+			storState.users[user.ID] = user
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().GetUser(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, id string) (*storage.User, error) {
+			if user, ok := storState.users[id]; ok {
+				return user, nil
+			}
+			return nil, storage.ErrNotFound
+		}).AnyTimes()
+
+	stor.EXPECT().GetProviderIdentity(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, providerID, providerSubject string) (*storage.ProviderIdentity, error) {
+			key := providerID + ":" + providerSubject
+			if identity, ok := storState.providerIdentities[key]; ok {
+				return identity, nil
+			}
+			return nil, storage.ErrNotFound
+		}).AnyTimes()
+
+	stor.EXPECT().CreateProviderIdentity(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, identity *storage.ProviderIdentity) error {
+			key := identity.ProviderID + ":" + identity.ProviderSubject
+			storState.providerIdentities[key] = identity
+			return nil
+		}).AnyTimes()
+
+	stor.EXPECT().UpdateProviderIdentityLastUsed(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, providerID, providerSubject string, lastUsedAt time.Time) error {
+			key := providerID + ":" + providerSubject
+			if identity, ok := storState.providerIdentities[key]; ok {
+				identity.LastUsedAt = lastUsedAt
+				return nil
+			}
+			return storage.ErrNotFound
+		}).AnyTimes()
+
+	stor.EXPECT().DeleteUser(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, id string) error {
+			if _, ok := storState.users[id]; !ok {
+				return storage.ErrNotFound
+			}
+			delete(storState.users, id)
+			return nil
+		}).AnyTimes()
+
+	jwtStrategy := compose.NewOAuth2JWTStrategy(
+		func(_ context.Context) (any, error) {
+			return rsaKey, nil
+		},
+		compose.NewOAuth2HMACStrategy(oauth2Config.Config),
+		oauth2Config.Config,
+	)
+
+	provider := compose.Compose(
+		oauth2Config.Config,
+		stor,
+		&compose.CommonStrategy{CoreStrategy: jwtStrategy},
+		compose.OAuth2AuthorizeExplicitFactory,
+		compose.OAuth2RefreshTokenGrantFactory,
+		compose.OAuth2PKCEFactory,
+	)
+
+	return provider, oauth2Config, stor, storState
 }
