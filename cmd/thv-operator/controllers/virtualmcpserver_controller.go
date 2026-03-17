@@ -268,7 +268,7 @@ func (r *VirtualMCPServerReconciler) applyStatusUpdates(
 }
 
 // runValidations runs all pre-reconciliation validations (PodTemplateSpec, GroupRef,
-// CompositeToolRefs, EmbeddingServerRef).
+// CompositeToolRefs, EmbeddingServerRef, AuthServerConfigRef).
 // Returns (true, nil) to continue reconciliation.
 // Returns (false, nil) for spec validation errors that should NOT trigger requeue
 // (user must fix the spec; next reconciliation is triggered by spec changes).
@@ -318,6 +318,25 @@ func (r *VirtualMCPServerReconciler) runValidations(
 				ctxLogger.Error(applyErr, "Failed to apply status updates after EmbeddingServerRef validation error")
 			}
 			return false, err
+		}
+	}
+
+	// Validate AuthServerConfigRef (when specified)
+	if vmcp.Spec.AuthServerConfigRef != nil {
+		valid, err := r.validateAuthServerConfigRef(ctx, vmcp, statusManager)
+		if err != nil {
+			// Transient error (e.g., API server unavailable) — requeue with backoff
+			if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
+				ctxLogger.Error(applyErr, "Failed to apply status updates after AuthServerConfigRef validation error")
+			}
+			return false, err
+		}
+		if !valid {
+			// Spec error (not found, wrong type) — don't requeue, user must fix
+			if applyErr := r.applyStatusUpdates(ctx, vmcp, statusManager); applyErr != nil {
+				ctxLogger.Error(applyErr, "Failed to apply status updates after AuthServerConfigRef spec error")
+			}
+			return false, nil
 		}
 	}
 
@@ -1918,6 +1937,79 @@ func (r *VirtualMCPServerReconciler) validateEmbeddingServerRef(
 	return nil
 }
 
+// validateAuthServerConfigRef validates that the referenced MCPExternalAuthConfig exists
+// and has type embeddedAuthServer.
+// Returns (true, nil) on success, (false, nil) for spec errors (no requeue),
+// and (false, error) for transient errors (requeue with backoff).
+func (r *VirtualMCPServerReconciler) validateAuthServerConfigRef(
+	ctx context.Context,
+	vmcp *mcpv1alpha1.VirtualMCPServer,
+	statusManager virtualmcpserverstatus.StatusManager,
+) (bool, error) {
+	ctxLogger := log.FromContext(ctx)
+
+	if vmcp.Spec.AuthServerConfigRef == nil {
+		return true, nil
+	}
+
+	refName := vmcp.Spec.AuthServerConfigRef.Name
+	extAuth := &mcpv1alpha1.MCPExternalAuthConfig{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      refName,
+		Namespace: vmcp.Namespace,
+	}, extAuth)
+
+	if errors.IsNotFound(err) {
+		message := fmt.Sprintf("Referenced MCPExternalAuthConfig %s not found", refName)
+		statusManager.SetPhase(mcpv1alpha1.VirtualMCPServerPhaseFailed)
+		statusManager.SetMessage(message)
+		statusManager.SetAuthServerConfigValidatedCondition(
+			mcpv1alpha1.ConditionReasonAuthServerConfigNotFound,
+			message,
+			metav1.ConditionFalse,
+		)
+		statusManager.SetObservedGeneration(vmcp.Generation)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(vmcp, corev1.EventTypeWarning, "AuthServerConfigRefNotFound",
+				"Referenced MCPExternalAuthConfig %s not found", refName)
+		}
+		// Not found is a spec error — watch will retrigger when resource is created
+		return false, nil
+	} else if err != nil {
+		ctxLogger.Error(err, "Failed to get referenced MCPExternalAuthConfig", "name", refName)
+		return false, err
+	}
+
+	// Verify type is embeddedAuthServer
+	if extAuth.Spec.Type != mcpv1alpha1.ExternalAuthTypeEmbeddedAuthServer {
+		message := fmt.Sprintf("Referenced MCPExternalAuthConfig %s has type %q, expected %q",
+			refName, extAuth.Spec.Type, mcpv1alpha1.ExternalAuthTypeEmbeddedAuthServer)
+		statusManager.SetPhase(mcpv1alpha1.VirtualMCPServerPhaseFailed)
+		statusManager.SetMessage(message)
+		statusManager.SetAuthServerConfigValidatedCondition(
+			mcpv1alpha1.ConditionReasonAuthServerConfigInvalid,
+			message,
+			metav1.ConditionFalse,
+		)
+		statusManager.SetObservedGeneration(vmcp.Generation)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(vmcp, corev1.EventTypeWarning, "AuthServerConfigRefInvalid",
+				"Referenced MCPExternalAuthConfig %s has wrong type %q", refName, extAuth.Spec.Type)
+		}
+		// Spec error — watch will retrigger when resource type is changed
+		return false, nil
+	}
+
+	// Set success condition
+	statusManager.SetAuthServerConfigValidatedCondition(
+		mcpv1alpha1.ConditionReasonAuthServerConfigValid,
+		"AuthServerConfigRef is valid",
+		metav1.ConditionTrue,
+	)
+
+	return true, nil
+}
+
 // mapEmbeddingServerToVirtualMCPServer maps EmbeddingServer changes to VirtualMCPServer
 // reconciliation requests. This triggers reconciliation when a referenced EmbeddingServer's
 // status changes (e.g., becomes ready or fails).
@@ -2243,12 +2335,18 @@ func (*VirtualMCPServerReconciler) vmcpReferencesToolConfig(vmcp *mcpv1alpha1.Vi
 }
 
 // vmcpReferencesExternalAuthConfig checks if a VirtualMCPServer references the given MCPExternalAuthConfig.
-// It checks both inline references (in outgoingAuth spec) and discovered references (via MCPServers in the group).
+// It checks authServerConfigRef, inline references (in outgoingAuth spec), and discovered references
+// (via MCPServers in the group).
 func (r *VirtualMCPServerReconciler) vmcpReferencesExternalAuthConfig(
 	ctx context.Context,
 	vmcp *mcpv1alpha1.VirtualMCPServer,
 	authConfigName string,
 ) bool {
+	// Check AuthServerConfigRef
+	if vmcp.Spec.AuthServerConfigRef != nil && vmcp.Spec.AuthServerConfigRef.Name == authConfigName {
+		return true
+	}
+
 	if vmcp.Spec.OutgoingAuth == nil {
 		return false
 	}
