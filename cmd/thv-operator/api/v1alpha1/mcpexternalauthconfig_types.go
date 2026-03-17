@@ -37,6 +37,14 @@ const (
 // ExternalAuthType represents the type of external authentication
 type ExternalAuthType string
 
+// ExternalAuthConfigRef defines a reference to a MCPExternalAuthConfig resource.
+// The referenced MCPExternalAuthConfig must be in the same namespace as the referencing resource.
+type ExternalAuthConfigRef struct {
+	// Name is the name of the MCPExternalAuthConfig resource
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+}
+
 // MCPExternalAuthConfigSpec defines the desired state of MCPExternalAuthConfig.
 // MCPExternalAuthConfig resources are namespace-scoped and can only be referenced by
 // MCPServer resources in the same namespace.

@@ -73,6 +73,14 @@ type VirtualMCPServerSpec struct {
 	// The referenced EmbeddingServer must exist in the same namespace and be ready.
 	// +optional
 	EmbeddingServerRef *EmbeddingServerRef `json:"embeddingServerRef,omitempty"`
+
+	// AuthServerConfigRef references an MCPExternalAuthConfig resource that configures
+	// an embedded OAuth authorization server (Mode B). When set, the vMCP server acts as
+	// an OIDC issuer, drives users through upstream IDPs, and issues ToolHive JWTs.
+	// The referenced MCPExternalAuthConfig must have type "embeddedAuthServer" and exist
+	// in the same namespace.
+	// +optional
+	AuthServerConfigRef *ExternalAuthConfigRef `json:"authServerConfigRef,omitempty"`
 }
 
 // EmbeddingServerRef references an existing EmbeddingServer resource by name.
@@ -225,6 +233,9 @@ const (
 
 	// ConditionTypeEmbeddingServerReady indicates whether the EmbeddingServer is ready
 	ConditionTypeEmbeddingServerReady = "EmbeddingServerReady"
+
+	// ConditionTypeAuthServerConfigValidated indicates whether the AuthServerConfigRef has been validated
+	ConditionTypeAuthServerConfigValidated = "AuthServerConfigValidated"
 )
 
 // Condition reasons for VirtualMCPServer
@@ -282,6 +293,15 @@ const (
 
 	// ConditionReasonEmbeddingServerNotReady indicates the referenced EmbeddingServer is not ready
 	ConditionReasonEmbeddingServerNotReady = "EmbeddingServerNotReady"
+
+	// ConditionReasonAuthServerConfigValid indicates the AuthServerConfigRef is valid
+	ConditionReasonAuthServerConfigValid = "AuthServerConfigValid"
+
+	// ConditionReasonAuthServerConfigNotFound indicates the referenced MCPExternalAuthConfig was not found
+	ConditionReasonAuthServerConfigNotFound = "AuthServerConfigNotFound"
+
+	// ConditionReasonAuthServerConfigInvalid indicates the referenced MCPExternalAuthConfig is invalid
+	ConditionReasonAuthServerConfigInvalid = "AuthServerConfigInvalid"
 )
 
 // Backend authentication types
@@ -393,8 +413,29 @@ func (r *VirtualMCPServer) Validate() error {
 		}
 	}
 
+	// Validate AuthServerConfigRef
+	if err := r.validateAuthServerConfig(); err != nil {
+		return err
+	}
+
 	// Validate EmbeddingServer / EmbeddingServerRef
 	return r.validateEmbeddingServer()
+}
+
+// validateAuthServerConfig validates AuthServerConfigRef.
+// Rules:
+// - authServerConfigRef.name must be non-empty when ref is provided
+//
+// The controller handles remaining runtime validation (fetching the resource,
+// checking type is embeddedAuthServer, issuer match).
+func (r *VirtualMCPServer) validateAuthServerConfig() error {
+	if r.Spec.AuthServerConfigRef == nil {
+		return nil
+	}
+	if r.Spec.AuthServerConfigRef.Name == "" {
+		return fmt.Errorf("spec.authServerConfigRef.name is required")
+	}
+	return nil
 }
 
 // validateEmbeddingServer validates EmbeddingServerRef and Optimizer configuration.
