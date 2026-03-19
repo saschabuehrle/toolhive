@@ -1970,7 +1970,7 @@ func (r *VirtualMCPServerReconciler) validateAuthServerConfigRef(
 		)
 		statusManager.SetObservedGeneration(vmcp.Generation)
 		if r.Recorder != nil {
-			r.Recorder.Eventf(vmcp, corev1.EventTypeWarning, "AuthServerConfigRefNotFound",
+			r.Recorder.Eventf(vmcp, nil, corev1.EventTypeWarning, "AuthServerConfigRefNotFound", "ValidateAuthServerConfigRef",
 				"Referenced MCPExternalAuthConfig %s not found", refName)
 		}
 		// Not found is a spec error — watch will retrigger when resource is created
@@ -1993,7 +1993,7 @@ func (r *VirtualMCPServerReconciler) validateAuthServerConfigRef(
 		)
 		statusManager.SetObservedGeneration(vmcp.Generation)
 		if r.Recorder != nil {
-			r.Recorder.Eventf(vmcp, corev1.EventTypeWarning, "AuthServerConfigRefInvalid",
+			r.Recorder.Eventf(vmcp, nil, corev1.EventTypeWarning, "AuthServerConfigRefInvalid", "ValidateAuthServerConfigRef",
 				"Referenced MCPExternalAuthConfig %s has wrong type %q", refName, extAuth.Spec.Type)
 		}
 		// Spec error — watch will retrigger when resource type is changed
