@@ -346,10 +346,10 @@ func buildAuthServerRunConfig(
 		rc.SigningKeyConfig = convertSigningKeyRefs(embCfg.SigningKeySecretRefs)
 	}
 
-	// Map HMAC secret refs to file paths.
+	// Map HMAC secret refs to file paths using the same mount paths as GenerateAuthServerVolumes.
 	for i := range embCfg.HMACSecretRefs {
-		ref := &embCfg.HMACSecretRefs[i]
-		filePath := fmt.Sprintf("%s/auth-server-hmac-%d/%s", secretMountBasePath, i, ref.Key)
+		filePath := fmt.Sprintf("%s/"+controllerutil.AuthServerHMACFilePattern,
+			controllerutil.AuthServerHMACMountPath, i)
 		rc.HMACSecretFiles = append(rc.HMACSecretFiles, filePath)
 	}
 
@@ -387,12 +387,14 @@ func convertSigningKeyRefs(refs []mcpv1alpha1.SecretKeyRef) *authserver.SigningK
 	if len(refs) == 0 {
 		return nil
 	}
+	// Use the same mount paths as GenerateAuthServerVolumes (controllerutil).
 	cfg := &authserver.SigningKeyRunConfig{
-		KeyDir:         fmt.Sprintf("%s/auth-server-signing-key-0", secretMountBasePath),
-		SigningKeyFile: refs[0].Key,
+		KeyDir:         controllerutil.AuthServerKeysMountPath,
+		SigningKeyFile: fmt.Sprintf(controllerutil.AuthServerKeyFilePattern, 0),
 	}
-	for i, ref := range refs[1:] {
-		fallbackPath := fmt.Sprintf("%s/auth-server-signing-key-%d/%s", secretMountBasePath, i+1, ref.Key)
+	for i := range refs[1:] {
+		fallbackPath := fmt.Sprintf("%s/"+controllerutil.AuthServerKeyFilePattern,
+			controllerutil.AuthServerKeysMountPath, i+1)
 		cfg.FallbackKeyFiles = append(cfg.FallbackKeyFiles, fallbackPath)
 	}
 	return cfg
@@ -436,6 +438,17 @@ func convertUpstreamProviders(
 		up, err := convertUpstreamProvider(&providers[i])
 		if err != nil {
 			return nil, fmt.Errorf("upstream provider %q (index %d): %w", provider.Name, i, err)
+		}
+		// Override client secret reference to use env var (matching GenerateAuthServerEnvVars)
+		// instead of file path. The deployment controller mounts secrets as indexed env vars.
+		envVarName := fmt.Sprintf("%s_%d", controllerutil.UpstreamClientSecretEnvVar, i)
+		if up.OIDCConfig != nil && up.OIDCConfig.ClientSecretFile != "" {
+			up.OIDCConfig.ClientSecretFile = ""
+			up.OIDCConfig.ClientSecretEnvVar = envVarName
+		}
+		if up.OAuth2Config != nil && up.OAuth2Config.ClientSecretFile != "" {
+			up.OAuth2Config.ClientSecretFile = ""
+			up.OAuth2Config.ClientSecretEnvVar = envVarName
 		}
 		upstreams = append(upstreams, up)
 	}
