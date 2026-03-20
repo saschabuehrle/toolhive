@@ -132,6 +132,83 @@ func TestDefaultStatusReportingConfig(t *testing.T) {
 	assert.Nil(t, config.Reporter, "Default reporter should be nil")
 }
 
+// testDynamicRegistry is a minimal vmcp.DynamicRegistry for testing version-change detection.
+type testDynamicRegistry struct {
+	mu      sync.Mutex
+	version uint64
+}
+
+func (r *testDynamicRegistry) Version() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.version
+}
+
+func (*testDynamicRegistry) List(_ context.Context) []vmcp.Backend         { return nil }
+func (*testDynamicRegistry) Get(_ context.Context, _ string) *vmcp.Backend { return nil }
+func (*testDynamicRegistry) Count() int                                    { return 0 }
+
+func (r *testDynamicRegistry) Upsert(_ vmcp.Backend) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.version++
+	return nil
+}
+
+func (r *testDynamicRegistry) Remove(_ string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.version++
+	return nil
+}
+
+// TestPeriodicStatusReporting_ReactsToVersionChange verifies that when the backend
+// registry version changes, an immediate status report is triggered via the version-polling
+// ticker rather than waiting for the full reporting interval.
+func TestPeriodicStatusReporting_ReactsToVersionChange(t *testing.T) {
+	t.Parallel()
+
+	reporter := &mockReporter{}
+	reg := &testDynamicRegistry{}
+	server := &Server{
+		backendRegistry: reg,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Use a long interval so the periodic tick never fires during the test.
+	config := StatusReportingConfig{
+		Interval: 30 * time.Second,
+		Reporter: reporter,
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.periodicStatusReporting(ctx, config)
+	}()
+
+	// Wait for the initial immediate report before triggering a version change.
+	require.Eventually(t, func() bool {
+		return reporter.getCallCount() >= 1
+	}, 3*time.Second, 10*time.Millisecond, "expected initial immediate status report")
+
+	countAfterInit := reporter.getCallCount()
+
+	// Trigger a version bump to simulate a backend being removed from the registry.
+	require.NoError(t, reg.Remove("some-backend"))
+
+	// The version-polling ticker fires every 2 seconds; allow up to 5 seconds.
+	require.Eventually(t, func() bool {
+		return reporter.getCallCount() > countAfterInit
+	}, 5*time.Second, 10*time.Millisecond,
+		"version change should trigger an immediate status report without waiting for the 30s interval")
+
+	cancel()
+	<-done
+}
+
 // TestReportStatus tests the reportStatus method.
 func TestReportStatus(t *testing.T) {
 	t.Parallel()

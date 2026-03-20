@@ -115,6 +115,15 @@ func (h *healthChecker) CheckHealth(ctx context.Context, target *vmcp.BackendTar
 	return vmcp.BackendHealthy, nil
 }
 
+// FlushIdleConnections closes idle connections for the given backend.
+// Implements vmcp.ConnectionFlusher by delegating to the underlying client if it supports it.
+// Called by the Monitor after a health check failure to evict stale keep-alive connections.
+func (h *healthChecker) FlushIdleConnections(backendID string) {
+	if flusher, ok := h.client.(vmcp.ConnectionFlusher); ok {
+		flusher.FlushIdleConnections(backendID)
+	}
+}
+
 // categorizeError determines the appropriate health status based on the error type.
 // This uses sentinel error checking with errors.Is() for type-safe error categorization.
 // Falls back to string-based detection for backwards compatibility with non-wrapped errors.

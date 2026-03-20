@@ -351,6 +351,10 @@ func (m *Monitor) UpdateBackends(newBackends []vmcp.Backend) {
 			}
 			// Remove backend from status tracker so it no longer appears in status reports
 			m.statusTracker.RemoveBackend(id)
+			// Evict the cached transport for this backend to free connections and memory
+			if flusher, ok := m.checker.(vmcp.ConnectionFlusher); ok {
+				flusher.FlushIdleConnections(id)
+			}
 		}
 	}
 }
@@ -424,6 +428,11 @@ func (m *Monitor) performHealthCheck(ctx context.Context, backend *vmcp.Backend)
 	if err != nil {
 		slog.Debug("health check failed for backend", "backend", backend.Name, "error", err, "status", status)
 		m.statusTracker.RecordFailure(backend.ID, backend.Name, status, err)
+		// Flush idle connections so the next attempt gets a fresh TCP connection.
+		// This recovers from stale keep-alive connections to pods that have been replaced.
+		if flusher, ok := m.checker.(vmcp.ConnectionFlusher); ok {
+			flusher.FlushIdleConnections(backend.ID)
+		}
 	} else {
 		// Pass status to RecordSuccess - it may be healthy or degraded (from slow response)
 		// RecordSuccess will further check for recovering state (had recent failures)

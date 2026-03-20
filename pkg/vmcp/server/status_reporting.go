@@ -67,7 +67,25 @@ func (s *Server) periodicStatusReporting(ctx context.Context, config StatusRepor
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Report status immediately after initial health checks complete
+	// Only start the version-polling ticker when the registry supports dynamic
+	// discovery. For static registries the ticker would fire every 2s only to
+	// type-assert and continue, wasting wakeups in the steady state.
+	dynamicReg, isDynamic := s.backendRegistry.(vmcp.DynamicRegistry)
+	var versionTickerC <-chan time.Time
+	var lastRegistryVersion uint64
+	if isDynamic {
+		const versionPollInterval = 2 * time.Second
+		versionTicker := time.NewTicker(versionPollInterval)
+		defer versionTicker.Stop()
+		versionTickerC = versionTicker.C
+	}
+
+	// Snapshot the version before reporting so that any mutation that races with
+	// reportStatus is visible to the version ticker on the next poll cycle, rather
+	// than being silently absorbed by a post-report version update.
+	if isDynamic {
+		lastRegistryVersion = dynamicReg.Version()
+	}
 	s.reportStatus(ctx, config.Reporter)
 
 	for {
@@ -77,7 +95,18 @@ func (s *Server) periodicStatusReporting(ctx context.Context, config StatusRepor
 			return
 
 		case <-ticker.C:
+			if isDynamic {
+				lastRegistryVersion = dynamicReg.Version()
+			}
 			s.reportStatus(ctx, config.Reporter)
+
+		case <-versionTickerC:
+			if v := dynamicReg.Version(); v != lastRegistryVersion {
+				slog.Debug("backend registry changed, triggering immediate status report",
+					"old_version", lastRegistryVersion, "new_version", v)
+				lastRegistryVersion = v
+				s.reportStatus(ctx, config.Reporter)
+			}
 		}
 	}
 }

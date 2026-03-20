@@ -6,6 +6,7 @@ package health
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -1164,4 +1165,89 @@ func TestMonitor_CircuitBreakerStatusReporting(t *testing.T) {
 	// Clean up
 	err = monitor.Stop()
 	require.NoError(t, err)
+}
+
+// flushingChecker is a test HealthChecker that also implements ConnectionFlusher.
+// It returns configurable results and records FlushIdleConnections calls.
+type flushingChecker struct {
+	mu         sync.Mutex
+	shouldFail bool
+	flushCalls []string
+}
+
+func (f *flushingChecker) CheckHealth(_ context.Context, _ *vmcp.BackendTarget) (vmcp.BackendHealthStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.shouldFail {
+		return vmcp.BackendUnhealthy, errors.New("connection refused")
+	}
+	return vmcp.BackendHealthy, nil
+}
+
+func (f *flushingChecker) FlushIdleConnections(backendID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flushCalls = append(f.flushCalls, backendID)
+}
+
+func (f *flushingChecker) getFlushCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.flushCalls))
+	copy(out, f.flushCalls)
+	return out
+}
+
+// TestMonitor_FlushIdleConnections verifies that FlushIdleConnections is called on
+// the checker after a health check failure and is not called after a success.
+func TestMonitor_FlushIdleConnections(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Use a stub BackendClient so NewMonitor is happy; we replace checker below.
+	stubClient := mocks.NewMockBackendClient(ctrl)
+	backend := vmcp.Backend{ID: "backend-1", Name: "Backend 1", BaseURL: "http://localhost:8080", TransportType: "sse"}
+
+	config := MonitorConfig{
+		CheckInterval:      50 * time.Millisecond,
+		UnhealthyThreshold: 1,
+		Timeout:            10 * time.Millisecond,
+	}
+
+	monitor, err := NewMonitor(stubClient, []vmcp.Backend{backend}, config)
+	require.NoError(t, err)
+
+	// Replace the internal checker with one that records flush calls.
+	checker := &flushingChecker{shouldFail: true}
+	monitor.checker = checker
+
+	ctx := context.Background()
+	require.NoError(t, monitor.Start(ctx))
+	defer func() { _ = monitor.Stop() }()
+
+	// Wait for at least one failure to be recorded and the flush to be triggered.
+	require.Eventually(t, func() bool {
+		return len(checker.getFlushCalls()) >= 1
+	}, 500*time.Millisecond, 10*time.Millisecond, "FlushIdleConnections should be called after a health check failure")
+
+	assert.Equal(t, "backend-1", checker.getFlushCalls()[0],
+		"FlushIdleConnections should be called with the correct backend ID")
+
+	// Switch to success and record the flush count at that point.
+	checker.mu.Lock()
+	checker.shouldFail = false
+	flushCountAtSwitch := len(checker.flushCalls)
+	checker.mu.Unlock()
+
+	// Wait for a successful health check to be recorded.
+	require.Eventually(t, func() bool {
+		s, statusErr := monitor.GetBackendStatus("backend-1")
+		return statusErr == nil && s == vmcp.BackendHealthy
+	}, 500*time.Millisecond, 10*time.Millisecond, "backend should recover to healthy")
+
+	// No additional flush calls should have been made during successful checks.
+	assert.Equal(t, flushCountAtSwitch, len(checker.getFlushCalls()),
+		"FlushIdleConnections should not be called after a successful health check")
 }

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -60,6 +61,14 @@ type httpBackendClient struct {
 	// registry manages authentication strategies for outgoing requests to backend MCP servers.
 	// Must not be nil - use UnauthenticatedStrategy for no authentication.
 	registry vmcpauth.OutgoingAuthRegistry
+
+	// transportMu protects transportCache.
+	transportMu sync.RWMutex
+
+	// transportCache holds one *http.Transport per backend ID so connections are
+	// reused across calls to the same backend. Call FlushIdleConnections to evict
+	// stale keep-alive connections (e.g., after a health check failure or backend replacement).
+	transportCache map[string]*http.Transport
 }
 
 // NewHTTPBackendClient creates a new HTTP-based backend client.
@@ -76,10 +85,73 @@ func NewHTTPBackendClient(registry vmcpauth.OutgoingAuthRegistry) (vmcp.BackendC
 	}
 
 	c := &httpBackendClient{
-		registry: registry,
+		registry:       registry,
+		transportCache: make(map[string]*http.Transport),
 	}
 	c.clientFactory = c.defaultClientFactory
 	return c, nil
+}
+
+// newBackendTransport creates a *http.Transport with the same defaults as http.DefaultTransport.
+// If http.DefaultTransport is a *http.Transport, it is cloned directly (preserving any
+// environment-specific settings like TLS config or proxy overrides). Otherwise a transport
+// with the standard Go defaults is constructed, preserving proxy, dial timeout, HTTP/2, and
+// idle-connection settings that a zero-value &http.Transport{} would drop.
+func newBackendTransport() *http.Transport {
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		return dt.Clone()
+	}
+	// http.DefaultTransport has been replaced (e.g. in tests or by a third-party library).
+	// Construct a transport with the same defaults as the Go standard library uses for
+	// http.DefaultTransport so we don't silently drop proxy, timeout, or HTTP/2 settings.
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+// getOrCreateTransport returns the cached *http.Transport for a backend, creating one if needed.
+// Each backend gets its own transport so connection pools are isolated per backend.
+func (h *httpBackendClient) getOrCreateTransport(backendID string) *http.Transport {
+	h.transportMu.RLock()
+	if t, ok := h.transportCache[backendID]; ok {
+		h.transportMu.RUnlock()
+		return t
+	}
+	h.transportMu.RUnlock()
+
+	h.transportMu.Lock()
+	defer h.transportMu.Unlock()
+	if t, ok := h.transportCache[backendID]; ok {
+		return t
+	}
+	t := newBackendTransport()
+	h.transportCache[backendID] = t
+	return t
+}
+
+// FlushIdleConnections closes all idle keep-alive connections for the given backend
+// and removes its transport from the cache so the next request gets a fresh connection.
+// This implements vmcp.ConnectionFlusher.
+func (h *httpBackendClient) FlushIdleConnections(backendID string) {
+	h.transportMu.Lock()
+	t, ok := h.transportCache[backendID]
+	if ok {
+		delete(h.transportCache, backendID)
+	}
+	h.transportMu.Unlock()
+	if ok {
+		t.CloseIdleConnections()
+		slog.Debug("flushed idle connections for backend", "backend", backendID)
+	}
 }
 
 // roundTripperFunc is a function adapter for http.RoundTripper.
@@ -173,7 +245,12 @@ func (h *httpBackendClient) resolveAuthStrategy(target *vmcp.BackendTarget) (vmc
 func (h *httpBackendClient) defaultClientFactory(ctx context.Context, target *vmcp.BackendTarget) (*client.Client, error) {
 	// Build transport chain (outermost to innermost, request execution order):
 	// size limit (response body) → trace propagation → identity propagation → authentication → HTTP
-	var baseTransport = http.DefaultTransport
+	//
+	// Use the per-backend cached transport so connections are reused across calls
+	// to the same backend. Each backend has an isolated pool, preventing stale
+	// keep-alive connections to one backend from affecting others.
+	// Call FlushIdleConnections after a failure to evict stale connections.
+	var baseTransport http.RoundTripper = h.getOrCreateTransport(target.WorkloadID)
 
 	// Resolve authentication strategy ONCE at client creation time
 	authStrategy, err := h.resolveAuthStrategy(target)
@@ -280,8 +357,9 @@ func (h *httpBackendClient) defaultClientFactory(ctx context.Context, target *vm
 // This enables type-safe error checking with errors.Is() instead of string matching.
 //
 // Error detection strategy (in order of preference):
-// 1. Check for standard Go error types (context errors, net.Error, url.Error)
-// 2. Fall back to string pattern matching for library-specific errors (MCP SDK, HTTP libs)
+// Check for standard Go error types (context errors, io.EOF, net.Error),
+// then mcp-go transport sentinels, then fall back to string pattern matching
+// for library-specific errors (MCP SDK, HTTP libs).
 //
 // Error chain preservation:
 // The returned error wraps the sentinel error (ErrTimeout, ErrBackendUnavailable, etc.) with %w
@@ -296,7 +374,7 @@ func wrapBackendError(err error, backendID string, operation string) error {
 		return nil
 	}
 
-	// 1. Type-based detection: Check for context deadline/cancellation
+	// Type-based detection: context deadline/cancellation
 	if errors.Is(err, context.DeadlineExceeded) {
 		return fmt.Errorf("%w: failed to %s for backend %s (timeout): %v",
 			vmcp.ErrTimeout, operation, backendID, err)
@@ -306,23 +384,37 @@ func wrapBackendError(err error, backendID string, operation string) error {
 			vmcp.ErrCancelled, operation, backendID, err)
 	}
 
-	// 2. Type-based detection: Check for io.EOF errors
-	// These indicate the connection was closed unexpectedly
+	// Type-based detection: io.EOF errors indicate the connection was closed unexpectedly
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return fmt.Errorf("%w: failed to %s for backend %s (connection closed): %v",
 			vmcp.ErrBackendUnavailable, operation, backendID, err)
 	}
 
-	// 3. Type-based detection: Check for net.Error with Timeout() method
-	// This handles network timeouts from the standard library
+	// Type-based detection: net.Error with Timeout() handles network timeouts from the standard library
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return fmt.Errorf("%w: failed to %s for backend %s (timeout): %v",
 			vmcp.ErrTimeout, operation, backendID, err)
 	}
 
-	// 4. String-based detection: Fall back to pattern matching for cases where
-	// we don't have structured error types (MCP SDK, HTTP libraries with embedded status codes)
+	// mcp-go transport sentinel errors: check these before string-based fallbacks
+	// to ensure accurate classification of protocol-level errors.
+	if errors.Is(err, transport.ErrUnauthorized) {
+		return fmt.Errorf("%w: failed to %s for backend %s: %v",
+			vmcp.ErrAuthenticationFailed, operation, backendID, err)
+	}
+	// ErrLegacySSEServer is returned for any 4xx (except 401) on initialize POST.
+	// This includes 403 (auth rejection) and 404/405 (endpoint not found/method not allowed).
+	// We cannot distinguish auth failures from routing errors without the raw status code,
+	// so we surface a clear message and classify as backend unavailable to allow recovery.
+	if errors.Is(err, transport.ErrLegacySSEServer) {
+		const legacyMsg = "server rejected MCP initialize — possible auth rejection or legacy SSE-only server"
+		return fmt.Errorf("%w: failed to %s for backend %s (%s): %v",
+			vmcp.ErrBackendUnavailable, operation, backendID, legacyMsg, err)
+	}
+
+	// String-based detection: fall back to pattern matching for cases where
+	// we don't have structured error types (MCP SDK, HTTP libraries with embedded status codes).
 	// Authentication errors (401, 403, auth failures)
 	if vmcp.IsAuthenticationError(err) {
 		return fmt.Errorf("%w: failed to %s for backend %s: %v",

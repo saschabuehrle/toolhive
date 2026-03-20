@@ -516,7 +516,7 @@ type HealthChecker interface {
 // Note: Resource _meta forwarding is not currently supported due to MCP SDK handler
 // signature limitations; the Meta field is preserved for future SDK improvements.
 //
-//go:generate mockgen -destination=mocks/mock_backend_client.go -package=mocks -source=types.go BackendClient HealthChecker
+//go:generate mockgen -destination=mocks/mock_backend_client.go -package=mocks -source=types.go BackendClient HealthChecker ConnectionFlusher
 type BackendClient interface {
 	// CallTool invokes a tool on the backend MCP server.
 	// The meta parameter contains _meta fields from the client request that should be forwarded to the backend.
@@ -536,6 +536,14 @@ type BackendClient interface {
 	// ListCapabilities queries a backend for its capabilities.
 	// Returns tools, resources, and prompts exposed by the backend.
 	ListCapabilities(ctx context.Context, target *BackendTarget) (*CapabilityList, error)
+}
+
+// ConnectionFlusher can flush idle connections for a specific backend.
+// Implemented by BackendClient when the underlying transport supports connection pooling.
+// Flushing evicts stale keep-alive connections, forcing a fresh dial on the next request.
+// This is used after health check failures to recover from stale connections to replaced pods.
+type ConnectionFlusher interface {
+	FlushIdleConnections(backendID string)
 }
 
 // CapabilityList contains the capabilities from a backend's MCP server.
