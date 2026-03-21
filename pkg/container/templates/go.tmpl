@@ -81,8 +81,8 @@ RUN cat /tmp/custom-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
     rm /tmp/custom-ca.crt
 {{end}}
 
-# Install only runtime dependencies
-RUN apk add --no-cache ca-certificates
+# Install runtime dependencies
+RUN apk add --no-cache {{range .RuntimeConfig.AdditionalPackages}}{{.}} {{end}}
 
 # Set working directory
 WORKDIR /app

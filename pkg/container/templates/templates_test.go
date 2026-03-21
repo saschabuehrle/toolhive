@@ -392,6 +392,73 @@ func TestGetDockerfileTemplate(t *testing.T) {
 	}
 }
 
+func TestRuntimeStageInstallsAdditionalPackages(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		transportType TransportType
+		runtimeConfig *RuntimeConfig
+		wantInRuntime string // string that must appear AFTER the second FROM
+	}{
+		{
+			name:          "NPX runtime stage installs extra packages",
+			transportType: TransportTypeNPX,
+			runtimeConfig: &RuntimeConfig{
+				BuilderImage:       "node:22-alpine",
+				AdditionalPackages: []string{"git", "ca-certificates", "curl"},
+			},
+			wantInRuntime: "curl",
+		},
+		{
+			name:          "UVX runtime stage installs extra packages",
+			transportType: TransportTypeUVX,
+			runtimeConfig: &RuntimeConfig{
+				BuilderImage:       "python:3.13-slim",
+				AdditionalPackages: []string{"ca-certificates", "git", "curl"},
+			},
+			wantInRuntime: "curl",
+		},
+		{
+			name:          "GO runtime stage installs extra packages",
+			transportType: TransportTypeGO,
+			runtimeConfig: &RuntimeConfig{
+				BuilderImage:       "golang:1.25-alpine",
+				AdditionalPackages: []string{"ca-certificates", "git", "curl"},
+			},
+			wantInRuntime: "curl",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			data := TemplateData{
+				MCPPackage:    "test-package",
+				RuntimeConfig: tt.runtimeConfig,
+			}
+
+			result, err := GetDockerfileTemplate(tt.transportType, data)
+			if err != nil {
+				t.Fatalf("GetDockerfileTemplate() error = %v", err)
+			}
+
+			// Find the runtime stage (second FROM) and check that
+			// AdditionalPackages appear there, not just in the builder.
+			parts := strings.SplitN(result, "\nFROM ", 2)
+			if len(parts) < 2 {
+				t.Fatal("Dockerfile does not contain a second FROM (runtime stage)")
+			}
+			runtimeStage := parts[1]
+
+			if !strings.Contains(runtimeStage, tt.wantInRuntime) {
+				t.Errorf("runtime stage does not install %q.\nRuntime stage:\n%s", tt.wantInRuntime, runtimeStage)
+			}
+		})
+	}
+}
+
 func TestParseTransportType(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

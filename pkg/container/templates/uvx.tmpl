@@ -90,16 +90,16 @@ RUN cat /tmp/custom-ca.crt >> /etc/ssl/certs/ca-certificates.crt && \
     rm /tmp/custom-ca.crt
 {{end}}
 
-# Install only runtime dependencies
+# Install runtime dependencies
 {{if isDebian .RuntimeConfig.BuilderImage}}
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends {{range .RuntimeConfig.AdditionalPackages}}{{.}} {{end}}&& \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 {{else if isAlpine .RuntimeConfig.BuilderImage}}
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache {{range .RuntimeConfig.AdditionalPackages}}{{.}} {{end}}
 {{else}}
 # Default to Debian-based package manager
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+RUN apt-get update && apt-get install -y --no-install-recommends {{range .RuntimeConfig.AdditionalPackages}}{{.}} {{end}}&& \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 {{end}}
